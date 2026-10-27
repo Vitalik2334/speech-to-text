@@ -30,8 +30,8 @@ fake_mod.STEP_INTERVAL_SEC = 0.3
 fake_mod.SAMPLE_RATE = 16_000
 fake_mod.VOICE_GATE = False
 fake_mod.apply_voice_gate = lambda audio: (audio, 0.0, 0.0)
-fake_mod.find_commit_point = lambda window: None
-fake_mod.should_skip_recognition = lambda audio, last: False
+fake_mod.choose_commit_cut = lambda window: None
+fake_mod.has_no_new_speech_since = lambda audio, last: False
 sys.modules["fake_dictation"] = fake_mod
 
 
@@ -68,13 +68,13 @@ class FakeApp:
     def _hook_release(self): pass
     def on_press(self): pass
     def on_release(self): pass
-    def _wait_step(self, started): return self.released
-    def transcribe_loop(self): self.events.emit("final_done")
+    def _wait_for_next_step(self, started): return self.released
+    def run_dictation_session(self): self.events.emit("final_done")
     def asr_pass(self, segment, kind, total_sec): return "текст"
-    def _confidence_check(self, text, logprobs): return self.noise, -0.4
+    def _classify_by_confidence(self, text, logprobs): return self.noise, -0.4
     def translate_text(self, text): return text
-    def paste_text(self, text): pass
-    def type_text(self, text): pass
+    def paste_via_clipboard(self, text): pass
+    def type_via_keystrokes(self, text): pass
 
 
 FakeApp.__module__ = "fake_dictation"
@@ -190,8 +190,8 @@ def test_release_latency_and_loop_wakeup(app, prof):
     app._hook_release()
     app.on_release()
     app.released = True
-    app._wait_step(0.0)
-    app._wait_step(0.0)               # другий раз латентність не додається
+    app._wait_for_next_step(0.0)
+    app._wait_for_next_step(0.0)               # другий раз латентність не додається
     stats = prof.stats()
     assert stats["latency: хук → on_release (черга Qt)"][0] == 1
     assert stats["latency: on_release → цикл прокинувся"][0] == 1
@@ -218,22 +218,22 @@ def test_per_step_line_printed(app, capsys):
 
 def test_confidence_rejected_counted(app, prof):
     app.noise = True
-    assert app._confidence_check("а", None) == (True, -0.4)
+    assert app._classify_by_confidence("а", None) == (True, -0.4)
     stats = prof.stats()
     assert stats["asr: відкинуто фільтром впевненості"][0] == 1
     assert stats["asr: фільтр впевненості"][0] == 1
 
 
 def test_output_label_has_length(app, prof):
-    app.paste_text("привіт")
-    app.type_text("ok")
+    app.paste_via_clipboard("привіт")
+    app.type_via_keystrokes("ok")
     stats = prof.stats()
     assert "вивід: буфер + Ctrl+V (6 симв.)" in stats
     assert "вивід: typer.type (2 симв.)" in stats
 
 
 def test_module_functions_wrapped(app, prof):
-    fake_mod.find_commit_point(np.zeros(1))
+    fake_mod.choose_commit_cut(np.zeros(1))
     fake_mod.apply_voice_gate(np.zeros(1))
     stats = prof.stats()
     assert "vad: пошук паузи" in stats and "vad: гейт голосу" in stats
@@ -252,9 +252,9 @@ def test_events(app, prof):
     assert stats["asr: фінал ПРОПУЩЕНО (взято текст кроку)"][0] == 1
 
 
-def test_transcribe_loop_prints_report(app, prof, capsys):
+def test_run_dictation_session_prints_report(app, prof, capsys):
     app._hook_release()
-    app.transcribe_loop()
+    app.run_dictation_session()
     out = capsys.readouterr().out
     assert "ПРОФІЛЬ НАТИСКАННЯ" in out
     assert "E2E: відпустили клавішу → текст надруковано" in out
@@ -263,7 +263,7 @@ def test_transcribe_loop_prints_report(app, prof, capsys):
 def test_report_derives_outside_onnx(app, prof):
     prof.add("asr: прохід (крок)", 0.5)
     prof.add("onnx:encoder-model.onnx", 0.3)
-    app.transcribe_loop()
+    app.run_dictation_session()
     # reset() у report не робиться — рядок лишається у статистиці
     assert prof.stats()["asr: поза ONNX (Python, numpy, декодер-цикл)"][1] == pytest.approx(0.2)
 

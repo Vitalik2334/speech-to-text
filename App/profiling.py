@@ -10,8 +10,8 @@ Overlay віддає сигнали display_started / display_finished.
 Усе інше робить attach_profiler(app):
   1. Обгортає методи ІНСТАНСУ (app.asr_pass, app.recorder.stop, ...) —
      setattr на інстанс, клас не змінюється.
-  2. Обгортає функції модуля застосунку (apply_voice_gate, find_commit_point,
-     should_skip_recognition) — вони викликаються за глобальним ім'ям, тому
+  2. Обгортає функції модуля застосунку (apply_voice_gate, choose_commit_cut,
+     has_no_new_speech_since) — вони викликаються за глобальним ім'ям, тому
      підміна в модулі підхоплюється одразу.
   3. Обгортає onnxruntime.InferenceSession.run (час кожної ONNX-моделі).
   4. Підписується на app.events і сигнали оверлея.
@@ -254,10 +254,10 @@ def describe_levels(cfg, audio: np.ndarray) -> str:
     """Рядок діагностики гучності: шум, мовлення, поріг паузи, найдовша
     пауза. Потрібен, щоб підібрати PAUSE_* під свій мікрофон. cfg — модуль
     застосунку (константи й функції VAD беруться звідти)."""
-    dbfs = cfg.frame_dbfs(audio)
+    dbfs = cfg.frame_levels_dbfs(audio)
     if len(dbfs) == 0:
         return "рівні: (порожньо)"
-    thr = cfg.pause_threshold(dbfs)
+    thr = cfg.adaptive_pause_threshold_dbfs(dbfs)
     longest = run = 0
     for quiet in dbfs < thr:
         run = run + 1 if quiet else 0
@@ -277,8 +277,8 @@ def describe_levels(cfg, audio: np.ndarray) -> str:
 # Функції модуля застосунку, які міряються підміною глобального імені.
 MODULE_FUNCTIONS = {
     "apply_voice_gate": "vad: гейт голосу",
-    "find_commit_point": "vad: пошук паузи",
-    "should_skip_recognition": "vad: should_skip_recognition",
+    "choose_commit_cut": "vad: пошук паузи",
+    "has_no_new_speech_since": "vad: has_no_new_speech_since",
 }
 
 
@@ -372,8 +372,8 @@ class DictationProfiler:
                     self.finish_report()
             return wrapper
 
-        wrap_attr(self.app, "_wait_step", wait_step)
-        wrap_attr(self.app, "transcribe_loop", loop)
+        wrap_attr(self.app, "_wait_for_next_step", wait_step)
+        wrap_attr(self.app, "run_dictation_session", loop)
 
     def finish_report(self) -> None:
         """Похідний рядок: скільки часу ASR пішло НЕ на ONNX (Python-цикл
@@ -436,13 +436,13 @@ class DictationProfiler:
             return wrapper
 
         wrap_attr(self.app, "asr_pass", asr_pass)
-        wrap_attr(self.app, "_confidence_check", confidence)
+        wrap_attr(self.app, "_classify_by_confidence", confidence)
         wrap_attr(self.app, "translate_text", timed(prof, "переклад OPUS-MT (torch)"))
 
     def _instrument_output(self) -> None:
-        wrap_attr(self.app, "paste_text",
+        wrap_attr(self.app, "paste_via_clipboard",
                   timed(self.prof, lambda text, *a, **kw: f"вивід: буфер + Ctrl+V ({len(text)} симв.)"))
-        wrap_attr(self.app, "type_text",
+        wrap_attr(self.app, "type_via_keystrokes",
                   timed(self.prof, lambda text, *a, **kw: f"вивід: typer.type ({len(text)} симв.)"))
 
     # ---- семантичні події застосунку ---------------------------------------
