@@ -6,7 +6,7 @@ profiling.attach_profiler(app), який обгортає методи Dictation
 слухає app.events. Вимкнути: PROFILE = False або аргумент --no-profile.
 
 Компіляція:
-   uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew1 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling App/UAFastConformer.py
+   uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew1 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling --hidden-import speech_detection --collect-data silero_vad --collect-all pedalboard App/UAFastConformer.py
 
 """
 import collections
@@ -24,6 +24,7 @@ from hotkeys_manager import HotkeyManager
 from pynput.keyboard import Controller as KbController
 from models_config import MODEL_TYPES, RECOMMENDED_CPU_QUANTIZATION, WHISPER_LANGUAGE, WHISPER_MODELS, ModelName
 from overlay import Overlay
+import speech_detection
 
 #TODO Після відправки цілого повідомлення. І ще раз пропускати все через модель.
 ACTIVE_MODEL = ModelName.NEMO_PARAKEET
@@ -111,6 +112,8 @@ class SessionTranscript:
     # soft_boundaries[i] — тип межі ПІСЛЯ committed_texts[i]: True = середина
     # речення (коротка пауза / примусовий розріз), False = кінець речення.
     soft_boundaries: list[bool] = field(default_factory=list)
+    # Маска VAD поточного кроку (по семплах усього запису) або None, якщо USE_VAD вимкнено.
+    speech_mask: np.ndarray | None = None
 
     def samples_seen_by_last_step(self) -> int:
         """Скільки семплів після committed_samples бачив останній крок."""
@@ -119,6 +122,10 @@ class SessionTranscript:
     def full_text(self, tail: str = "") -> str:
         """Увесь текст: зафіксовані шматки + хвіст, склеєні з урахуванням меж."""
         return join_text_segments(self.committed_texts + [tail], self.soft_boundaries)
+
+    def speech_mask_slice(self, start: int, end: int | None = None) -> np.ndarray | None:
+        """Маска VAD для audio[start:end] поточного кроку або None (USE_VAD вимкнено)."""
+        return None if self.speech_mask is None else self.speech_mask[start:end]
 
     def commit_segment(self, segment: str, cut: int, audio, soft_cut: bool = False) -> None:
         """Фіксує шматок довжиною cut і скидає стан хвоста.
@@ -131,7 +138,8 @@ class SessionTranscript:
             self.soft_boundaries[-1] = False
         self.committed_samples += cut
         self.tail_text = ""
-        self.tail_valid = not has_voiced_frames(audio[self.committed_samples:])
+        self.tail_valid = not has_voiced_frames(audio[self.committed_samples:],
+                                                self.speech_mask_slice(self.committed_samples))
         self.last_audio_len = len(audio)
 
 
@@ -264,15 +272,27 @@ def frame_levels_dbfs(audio: np.ndarray) -> np.ndarray:
     return 20.0 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-12)
 
 
-def has_voiced_frames(audio: np.ndarray) -> bool:
-    """Чи є в шматку хоча б MIN_VOICED_FRAMES гучних кадрів."""
+def speech_frames_from_mask(speech_mask: np.ndarray) -> np.ndarray:
+    """Маска VAD по семплах → чи є мовлення в кожному кадрі FRAME_SEC
+    (кадри ті самі, що у frame_levels_dbfs; неповний хвіст відкидається)."""
+    n = len(speech_mask) // FRAME_LEN
+    return speech_mask[: n * FRAME_LEN].reshape(n, FRAME_LEN).any(axis=1)
+
+
+def has_voiced_frames(audio: np.ndarray, speech_mask: np.ndarray | None = None) -> bool:
+    """Чи є в шматку хоча б MIN_VOICED_FRAMES кадрів мовлення: за маскою VAD,
+    якщо її передано, інакше — за гучністю (кадр гучніший за SILENCE_DBFS)."""
+    if speech_mask is not None:
+        return int(np.sum(speech_frames_from_mask(speech_mask))) >= MIN_VOICED_FRAMES
     return int(np.sum(frame_levels_dbfs(audio) >= SILENCE_DBFS)) >= MIN_VOICED_FRAMES
 
 
-def has_no_new_speech_since(audio: np.ndarray, last_audio_len: int) -> bool:
+def has_no_new_speech_since(audio: np.ndarray, last_audio_len: int,
+                            speech_mask: np.ndarray | None = None) -> bool:
     """True, якщо в аудіо, що з'явилося після останнього розпізнавання,
     немає мовлення - тоді перерозпізнавати немає сенсу."""
-    return not has_voiced_frames(audio[last_audio_len:])
+    new_mask = None if speech_mask is None else speech_mask[last_audio_len:]
+    return not has_voiced_frames(audio[last_audio_len:], new_mask)
 
 
 # --- Ковзне вікно ---------------------------------------------------------
@@ -318,14 +338,20 @@ def adaptive_pause_threshold_dbfs(dbfs: np.ndarray) -> float:
     return max(thr, SILENCE_DBFS)
 
 
-def find_last_long_pause(window: np.ndarray, min_pause: int, min_end: int
+def find_last_long_pause(window: np.ndarray, min_pause: int, min_end: int,
+                         speech_mask: np.ndarray | None = None
                          ) -> tuple[np.ndarray, tuple[int, int, bool] | None]:
     """Повертає (рівні кадрів у dBFS, остання пауза довжиною >= min_pause кадрів,
     що закінчується не раніше кадру min_end). Пауза — це
-    (кадр посередині паузи, довжина в кадрах, чи триває вона до кінця вікна) або None."""
+    (кадр посередині паузи, довжина в кадрах, чи триває вона до кінця вікна) або None.
+    Паузою вважається кадр без мовлення за маскою VAD, якщо її передано,
+    інакше — кадр, тихіший за адаптивний поріг."""
     levels = frame_levels_dbfs(window)
     n_frames = len(levels)
-    is_quiet = levels < adaptive_pause_threshold_dbfs(levels)
+    if speech_mask is not None:
+        is_quiet = ~speech_frames_from_mask(speech_mask)
+    else:
+        is_quiet = levels < adaptive_pause_threshold_dbfs(levels)
 
     last = None          # (кадр розрізу, довжина паузи, пауза до кінця вікна)
     pause_len = 0
@@ -341,7 +367,8 @@ def find_last_long_pause(window: np.ndarray, min_pause: int, min_end: int
     return levels, last
 
 
-def choose_commit_cut(window: np.ndarray) -> tuple[int, bool] | None:
+def choose_commit_cut(window: np.ndarray,
+                      speech_mask: np.ndarray | None = None) -> tuple[int, bool] | None:
     """Де зафіксувати вікно: (позиція розрізу в семплах, м'яка межа) або None.
 
     * Є довга пауза — ріже посередині неї; межа м'яка, якщо пауза коротша
@@ -355,7 +382,7 @@ def choose_commit_cut(window: np.ndarray) -> tuple[int, bool] | None:
     sent_pause = max(min_pause, int(round(SENTENCE_PAUSE_SEC / FRAME_SEC)))
     min_end = int(COMMIT_MIN_SEC / FRAME_SEC)
 
-    levels, last = find_last_long_pause(window, min_pause, min_end)
+    levels, last = find_last_long_pause(window, min_pause, min_end, speech_mask)
 
     if last is not None:
         cut, length, at_end = last
@@ -382,6 +409,21 @@ def choose_commit_cut(window: np.ndarray) -> tuple[int, bool] | None:
 VOICE_GATE = True
 VOICE_GATE_DBFS = -40.0
 VOICE_GATE_HOLD_SEC = 0.35
+
+# --- Нейромережевий детектор мовлення (Silero VAD v6) ---------------------
+# USE_VAD = True: чи є мовлення і де паузи, вирішує Silero VAD (див.
+# speech_detection.py), а не поріг гучності. Після VAD фрагменти мовлення
+# проходять гейт гучності pedalboard.NoiseGate (якщо VOICE_GATE): тихіший за
+# NOISE_GATE_THRESHOLD_DB фон глушиться. USE_VAD = False — стара логіка
+# "за гучністю" вище (SILENCE_DBFS, адаптивний поріг пауз, apply_voice_gate).
+USE_VAD = True
+VAD_SPEECH_THRESHOLD = 0.5      # з цієї ймовірності починається мовлення...
+VAD_SILENCE_THRESHOLD = 0.35    # ...і триває, поки ймовірність не впаде нижче
+VAD_PAD_SEC = 0.1               # запас навколо мовлення, щоб не різати краї слів
+NOISE_GATE_THRESHOLD_DB = VOICE_GATE_DBFS
+NOISE_GATE_RATIO = 10.0
+NOISE_GATE_ATTACK_MS = 1.0
+NOISE_GATE_RELEASE_MS = VOICE_GATE_HOLD_SEC * 1000
 
 
 def voice_gate_threshold(dbfs: np.ndarray) -> float:  # noqa: ARG001
@@ -495,6 +537,7 @@ class DictationApp:
         self.ts_model = None
         self._translator = None          # (tokenizer, model)
         self._typer = KbController()
+        self.speech_tracker: speech_detection.SpeechProbabilityTracker | None = None
 
         self.bridge: HotkeyBridge | None = None
         self.hotkeys: HotkeyManager | None = None
@@ -511,6 +554,8 @@ class DictationApp:
 
         self.model = self._load_asr_model()
         self.ts_model = self.model.with_timestamps()
+        if USE_VAD:
+            self.speech_tracker = speech_detection.SpeechProbabilityTracker(SAMPLE_RATE)
         self.get_translator()
         self.overlay.dismiss()
 
@@ -686,39 +731,74 @@ class DictationApp:
         return not self.is_recording.is_set()
 
     def _recognize_committed_head(self, head: np.ndarray, cut: int, state: SessionTranscript,
-                                  duration: float) -> str:
+                                  duration: float, head_speech_mask: np.ndarray | None = None) -> str:
         """Розпізнає шматок до паузи. Якщо фільтр відкинув результат,
         але останній крок покривав той самий шматок, бере текст кроку,
-        щоб сказане не зникло. Винятки ASR пробрасує нагору."""
-        segment = self.asr_pass(head, "фіксація", duration) if has_voiced_frames(head) else ""
+        щоб сказане не зникло. Винятки ASR пробрасує нагору.
+        head_speech_mask — маска VAD для head (None — перевірка за гучністю)."""
+        head_has_speech = (has_voiced_frames(head) if head_speech_mask is None
+                           else has_voiced_frames(head, head_speech_mask))
+        segment = self.asr_pass(head, "фіксація", duration) if head_has_speech else ""
         step_saw_same_head = _last_step_ended_inside_pause(state.samples_seen_by_last_step(), cut)
         if not segment and state.tail_text and step_saw_same_head:
             self.events.emit("commit_fallback")
             return state.tail_text
         return segment
 
-    def _capture_gated_audio(self, released: bool) -> tuple[np.ndarray, np.ndarray, float]:
-        """(аудіо з обнуленим фоном, сире аудіо, частка заглушеного).
+    def _start_speech_tracking(self) -> None:
+        """Новий запис — новий стан рекурентної моделі VAD."""
+        if self.speech_tracker is None:
+            self.speech_tracker = speech_detection.SpeechProbabilityTracker(SAMPLE_RATE)
+        self.speech_tracker.reset()
+
+    def _detect_speech(self, raw_audio: np.ndarray) -> np.ndarray:
+        """Маска мовлення за Silero VAD для кожного семпла запису (з запасом VAD_PAD_SEC)."""
+        probs = self.speech_tracker.update(raw_audio)
+        chunks = speech_detection.speech_mask_from_probabilities(
+            probs, VAD_SPEECH_THRESHOLD, VAD_SILENCE_THRESHOLD)
+        pad_chunks = int(round(VAD_PAD_SEC * SAMPLE_RATE / speech_detection.VAD_CHUNK))
+        chunks = speech_detection.widen_mask(chunks, pad_chunks)
+        return speech_detection.chunk_mask_to_samples(chunks, len(raw_audio))
+
+    def _gate_by_vad(self, raw_audio: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+        """(аудіо, де не-мовлення обнулено й тихий фон приглушено гейтом,
+        частка заглушеного, маска мовлення)."""
+        speech_mask = self._detect_speech(raw_audio)
+        audio = raw_audio * speech_mask
+        if VOICE_GATE:
+            audio = speech_detection.apply_noise_gate(
+                audio, SAMPLE_RATE, NOISE_GATE_THRESHOLD_DB, NOISE_GATE_RATIO,
+                NOISE_GATE_ATTACK_MS, NOISE_GATE_RELEASE_MS)
+        return audio, float(1.0 - speech_mask.mean()), speech_mask
+
+    def _capture_gated_audio(self, released: bool
+                             ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray | None]:
+        """(аудіо з обнуленим фоном, сире аудіо, частка заглушеного, маска VAD або None).
         Після відпускання клавіші — весь запис (stop()), інакше — знімок (snapshot())."""
         raw_audio = self.recorder.stop() if released else self.recorder.snapshot()
+        if USE_VAD and len(raw_audio):
+            audio, muted_share, speech_mask = self._gate_by_vad(raw_audio)
+            return audio, raw_audio, muted_share, speech_mask
         if not (VOICE_GATE and len(raw_audio)):
-            return raw_audio, raw_audio, 0.0
+            return raw_audio, raw_audio, 0.0, None
         # Далі ВСЕ (пошук пауз, перевірка мовлення, ASR) бачить
         # аудіо, де фон обнулено. Гейт рахується по всьому запису,
         # тож поріг стабільний між кроками.
         audio, _gate_thr, muted_share = apply_voice_gate(raw_audio)
-        return audio, raw_audio, muted_share
+        return audio, raw_audio, muted_share, None
 
     def _handle_partial_step(self, audio: np.ndarray, window: np.ndarray,
                              state: SessionTranscript, duration: float) -> None:
         """Крок, поки клавіша затиснута. Є пауза у вікні — шматок до неї
         розпізнається і фіксується (цей прохід замість кроку); інакше
         показується вже наявний текст."""
-        commit_point = choose_commit_cut(window)
+        start = state.committed_samples
+        commit_point = choose_commit_cut(window, state.speech_mask_slice(start))
         if commit_point is not None:
             cut, soft_cut = commit_point
             try:
-                segment = self._recognize_committed_head(window[:cut], cut, state, duration)
+                segment = self._recognize_committed_head(window[:cut], cut, state, duration,
+                                                         state.speech_mask_slice(start, start + cut))
             except Exception as exc:  # noqa: BLE001
                 print(f"\n(помилка розпізнавання: {exc})", file=sys.stderr)
                 return
@@ -736,10 +816,10 @@ class DictationApp:
         """Клавішу відпустили: дорозпізнати хвіст (якщо після останнього кроку
         з'явилося мовлення), перекласти, показати й вставити текст."""
         self.events.emit("final_audio", raw_audio=raw_audio, muted_share=muted_share)
-        if state.tail_valid and has_no_new_speech_since(audio, state.last_audio_len):
+        if state.tail_valid and has_no_new_speech_since(audio, state.last_audio_len, state.speech_mask):
             # Після останнього кроку нового мовлення не було — хвіст уже розпізнано.
             self.events.emit("final_skipped")
-        elif has_voiced_frames(window):
+        elif has_voiced_frames(window, state.speech_mask_slice(state.committed_samples)):
             print(" розпізнаю...", end="", flush=True)
             self.overlay.display("Розпізнаю...", state="processing")
             try:
@@ -776,11 +856,13 @@ class DictationApp:
         step_started_at = time.perf_counter()
 
         try:
+            if USE_VAD:
+                self._start_speech_tracking()
             while True:
                 released = self._wait_for_next_step(step_started_at)
                 step_started_at = time.perf_counter()
 
-                audio, raw_audio, muted_share = self._capture_gated_audio(released)
+                audio, raw_audio, muted_share, state.speech_mask = self._capture_gated_audio(released)
                 duration = len(audio) / SAMPLE_RATE
 
                 if released and duration < MIN_SECONDS:
