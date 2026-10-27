@@ -1,0 +1,9 @@
+{
+  "recognized": "Раз, два, три, четыре, пять, шесть, семь, восемь, девять, десять.",
+  "model": "nemo-parakeet-tdt-0.6b-v3",
+  "quantization": null,
+  "voice_gate": true,
+  "duration_sec": 4.368,
+  "sample_rate": 16000,
+  "captured_at": "2026-10-18T19:19:11+02:00"
+}

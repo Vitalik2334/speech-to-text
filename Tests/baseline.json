@@ -1,0 +1,72 @@
+{
+  "created_at": "2026-10-18T19:41:32+02:00",
+  "model": "nemo-parakeet-tdt-0.6b-v3",
+  "quantization": null,
+  "clips_count": 4,
+  "total": {
+    "cer": 0.03716814159292035,
+    "wer": 0.12121212121212122
+  },
+  "by_tag": {
+    "medium": {
+      "cer": 0.0196078431372549,
+      "wer": 0.06741573033707865
+    },
+    "short": {
+      "cer": 0.2,
+      "wer": 0.6
+    }
+  },
+  "streaming_gap_cer": -0.005309734513274336,
+  "punct_f1": 0.5,
+  "clips": {
+    "0001": {
+      "ref": "5a7fc9ed12e6",
+      "cer": 0.2,
+      "wer": 0.6
+    },
+    "0003": {
+      "ref": "aaf182e607ac",
+      "cer": 0.0091324200913242,
+      "wer": 0.024390243902439025
+    },
+    "0004": {
+      "ref": "6774c2cdb9f2",
+      "cer": 0.0,
+      "wer": 0.0
+    },
+    "0005": {
+      "ref": "6f96544d8532",
+      "cer": 0.05263157894736842,
+      "wer": 0.21739130434782608
+    }
+  },
+  "config": {
+    "ACTIVE_MODEL": "nemo-parakeet-tdt-0.6b-v3",
+    "QUANTIZATION": null,
+    "FORCE_CPU": true,
+    "SAMPLE_RATE": 16000,
+    "MAX_SECONDS": 120.0,
+    "MIN_SECONDS": 0.2,
+    "STEP_INTERVAL_SEC": 0.3,
+    "STEP_MIN_AUDIO_SEC": 0.3,
+    "MIN_AVG_LOGPROB": -0.4,
+    "MIN_AVG_LOGPROB_LONG": -1.0,
+    "CONF_SHORT_WORDS": 2,
+    "SILENCE_DBFS": -45.0,
+    "FRAME_SEC": 0.05,
+    "MIN_VOICED_FRAMES": 3,
+    "COMMIT_MIN_SEC": 1.0,
+    "COMMIT_PAUSE_SEC": 0.5,
+    "SENTENCE_PAUSE_SEC": 0.5,
+    "COMMIT_MAX_WINDOW_SEC": 10,
+    "FORCED_CUT_SEARCH_SEC": 3.0,
+    "FORCED_CUT_GUARD_SEC": 0.5,
+    "PAUSE_NOISE_PERCENTILE": 10,
+    "PAUSE_MARGIN_DB": 8.0,
+    "PAUSE_SPEECH_GAP_DB": 10.0,
+    "VOICE_GATE": true,
+    "VOICE_GATE_DBFS": -40.0,
+    "VOICE_GATE_HOLD_SEC": 0.35
+  }
+}
