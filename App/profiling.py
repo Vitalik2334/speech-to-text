@@ -391,6 +391,11 @@ class DictationProfiler:
         wrap_attr(rec, "start", timed(self.prof, "audio: recorder.start()"))
         wrap_attr(rec, "snapshot", timed(self.prof, "audio: snapshot()"))
         wrap_attr(rec, "stop", timed(self.prof, "audio: stop()"))
+        # Нейромережевий VAD і гейт після нього (є лише в застосунку з USE_VAD).
+        if hasattr(self.app, "_detect_speech"):
+            wrap_attr(self.app, "_detect_speech", timed(self.prof, "vad: silero"))
+        if hasattr(self.app, "_gate_by_vad"):
+            wrap_attr(self.app, "_gate_by_vad", timed(self.prof, "vad: silero + noise gate"))
 
     def _instrument_module_functions(self) -> None:
         for func, label in MODULE_FUNCTIONS.items():
