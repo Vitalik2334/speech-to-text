@@ -6,8 +6,7 @@ profiling.attach_profiler(app), який обгортає методи Dictation
 слухає app.events. Вимкнути: PROFILE = False або аргумент --no-profile.
 
 Компіляція:
-   uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew1 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling --hidden-import speech_detection --collect-data silero_vad --collect-all pedalboard App/UAFastConformer.py
-
+uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew2 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling --hidden-import speech_detection --collect-all silero_vad --collect-all pedalboard App/UAFastConformer.py
 """
 import collections
 import sys

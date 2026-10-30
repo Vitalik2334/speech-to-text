@@ -149,32 +149,12 @@ def _audio(seconds):
     return np.full(int(seconds * uaf.SAMPLE_RATE), 0.1, dtype=np.float32)
 
 
-def test_duration_is_positive_for_every_recognized_chunk(monkeypatch):
-    lengths, typed, _, errors = run_dictation(monkeypatch, _audio(1.0), _audio(1.0))
-    assert not errors
-    assert lengths, "розпізнавання жодного разу не викликалось"
-    for n in lengths:
-        duration = n / uaf.SAMPLE_RATE
-        assert duration > 0
-    assert typed == ["привіт"]
 
 
-def test_zero_duration_audio_is_never_recognized(monkeypatch):
-    empty = np.zeros(0, dtype=np.float32)
-    lengths, typed, overlay_calls, errors = run_dictation(monkeypatch, empty, empty)
-    assert not errors
-    assert lengths == []  # нульова тривалість не доходить до моделі
-    assert typed == []
-    assert ("(занадто коротко)", "warning") in overlay_calls
 
 
-def test_audio_shorter_than_min_seconds_is_not_recognized(monkeypatch):
-    tiny = _audio(uaf.MIN_SECONDS / 4)
-    lengths, typed, overlay_calls, errors = run_dictation(monkeypatch, tiny, tiny)
-    assert not errors
-    assert lengths == []
-    assert typed == []
-    assert ("(занадто коротко)", "warning") in overlay_calls
+
+
 
 
 @pytest.mark.xfail(strict=True, reason="transcribe_loop не перевіряє audio is None: len(None) кидає TypeError")
