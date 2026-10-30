@@ -456,6 +456,7 @@ class DictationProfiler:
         prof, ev = self.prof, self.app.events
         ev.subscribe("commit_fallback", lambda **_: prof.add("asr: фіксація взяла текст кроку", 0.0))
         ev.subscribe("final_skipped", lambda **_: prof.add("asr: фінал ПРОПУЩЕНО (взято текст кроку)", 0.0))
+        ev.subscribe("full_pass_done", lambda **_: prof.add("asr: повний прохід по всьому запису", 0.0))
         ev.subscribe("partial_text", self._on_partial_text)
         ev.subscribe("final_audio", self._on_final_audio)
         ev.subscribe("final_done", lambda **_: prof.add("E2E: відпустили клавішу → текст надруковано",

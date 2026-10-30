@@ -462,7 +462,8 @@ class DictationApp:
         partial_text(text)               — показано проміжний текст
         commit_fallback()                — фіксація взяла текст кроку
         final_audio(raw_audio, muted_share) — почався фінальний крок
-        final_skipped()                  — фінал не розпізнавали (нового мовлення немає)
+        final_skipped()                  — запасний шлях: хвіст не розпізнавали (нового мовлення немає)
+        full_pass_done(text)             — повний прохід по всьому запису дав текст
         final_done()                     — фінальний текст показано / надруковано
 
     Порядок: DictationApp() → [attach_profiler(app)] → load() → run()."""
@@ -755,29 +756,55 @@ class DictationApp:
         self.events.emit("partial_text", text=text)
         self.overlay.display((text or "Слухаю...") + self.translation_mode_suffix(), state="listening")
 
-    def _finish_session(self, audio: np.ndarray, raw_audio: np.ndarray, muted_share: float,
-                        window: np.ndarray, state: SessionTranscript, duration: float) -> None:
-        """Клавішу відпустили: дорозпізнати хвіст (якщо після останнього кроку
-        з'явилося мовлення), перекласти, показати й вставити текст."""
-        self.events.emit("final_audio", raw_audio=raw_audio, muted_share=muted_share)
+    def _recognize_full_recording(self, audio: np.ndarray, duration: float) -> str:
+        """Ще один прохід тієї самої ASR-моделі по ВСЬОМУ запису від початку.
+        Модель бачить увесь контекст, а не окремі шматки між паузами.
+        При помилці повертає "" - тоді лишається текст зафіксованих шматків."""
+        try:
+            return self.asr_pass(audio, "фінал-повний", duration)
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n(помилка повного проходу: {exc})", file=sys.stderr)
+            return ""
+
+    def _recognize_final_tail(self, audio: np.ndarray, window: np.ndarray,
+                              state: SessionTranscript, duration: float) -> None:
+        """Запасний шлях: дорозпізнати хвіст після останньої паузи
+        (якщо після останнього кроку з'явилося мовлення) і покласти в state.tail_text."""
         if state.tail_valid and has_no_new_speech_since(audio, state.last_audio_len, state.speech_mask):
-            # Після останнього кроку нового мовлення не було — хвіст уже розпізнано.
+            # Після останнього кроку нового мовлення не було - хвіст уже розпізнано.
             self.events.emit("final_skipped")
         elif has_voiced_frames(window, state.speech_mask_slice(state.committed_samples)):
-            print(" розпізнаю...", end="", flush=True)
-            self.overlay.display("Розпізнаю...", state="processing")
             try:
                 final_tail = self.asr_pass(window, "фінал", duration)
             except Exception as exc:  # noqa: BLE001
                 print(f"\n(помилка розпізнавання: {exc})", file=sys.stderr)
                 final_tail = ""
             # Фінал порожній (шум у кінці / фільтр), а крок раніше
-            # щось розпізнав — віддаємо текст кроку, а не нічого.
+            # щось розпізнав - віддаємо текст кроку, а не нічого.
             if final_tail:
                 state.tail_text = final_tail
-        # else: нового мовлення у хвості немає — лишаємо текст останнього кроку
+        # else: нового мовлення у хвості немає - лишаємо текст останнього кроку
 
-        recognized = state.full_text(state.tail_text)
+    def _finish_session(self, audio: np.ndarray, raw_audio: np.ndarray, muted_share: float,
+                        window: np.ndarray, state: SessionTranscript, duration: float) -> None:
+        """Клавішу відпустили: ще раз розпізнати ВЕСЬ запис однією моделлю
+        (повний прохід). Якщо він нічого не дав - запасний шлях: зафіксовані
+        шматки + розпізнаний хвіст. Далі переклад, показ і вставка тексту."""
+        self.events.emit("final_audio", raw_audio=raw_audio, muted_share=muted_share)
+
+        full_text = ""
+        if has_voiced_frames(audio, state.speech_mask):
+            print(" розпізнаю...", end="", flush=True)
+            self.overlay.display("Розпізнаю...", state="processing")
+            full_text = self._recognize_full_recording(audio, duration)
+
+        if full_text:
+            recognized = full_text
+            self.events.emit("full_pass_done", text=full_text)
+        else:
+            self._recognize_final_tail(audio, window, state, duration)
+            recognized = state.full_text(state.tail_text)
+
         output = self.translate_if_enabled(recognized)
 
         self.show_final_text(recognized, output)
@@ -792,9 +819,8 @@ class DictationApp:
           * якщо у вікні (аудіо після зафіксованої частини) знайшлася пауза —
             шматок до паузи розпізнається ОДИН раз і фіксується в committed_texts;
           * інакше розпізнається лише хвіст після зафіксованої частини.
-        Після відпускання розпізнається тільки хвіст (або береться текст
-        останнього кроку, якщо нового мовлення не було), а результат —
-        зафіксовані сегменти + хвіст."""
+        Після відпускання весь запис розпізнається ще раз цілком; якщо це
+        нічого не дало - результат: зафіксовані сегменти + хвіст."""
         self.is_busy.set()
         state = SessionTranscript()  # новий стан на КОЖНЕ натискання
         step_started_at = time.perf_counter()
