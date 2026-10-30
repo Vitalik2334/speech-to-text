@@ -109,9 +109,6 @@ class SessionTranscript:
     tail_text: str = ""         # текст останнього кроку по незафіксованому хвосту
     tail_valid: bool = True     # чи хвіст без мовлення (текст кроку не потрібен)
     last_audio_len: int = 0     # довжина audio на момент останнього кроку
-    # soft_boundaries[i] — тип межі ПІСЛЯ committed_texts[i]: True = середина
-    # речення (коротка пауза / примусовий розріз), False = кінець речення.
-    soft_boundaries: list[bool] = field(default_factory=list)
     # Маска VAD поточного кроку (по семплах усього запису) або None, якщо USE_VAD вимкнено.
     speech_mask: np.ndarray | None = None
 
@@ -120,22 +117,17 @@ class SessionTranscript:
         return self.last_audio_len - self.committed_samples
 
     def full_text(self, tail: str = "") -> str:
-        """Увесь текст: зафіксовані шматки + хвіст, склеєні з урахуванням меж."""
-        return join_text_segments(self.committed_texts + [tail], self.soft_boundaries)
+        """Увесь текст: зафіксовані шматки + хвіст."""
+        return join_text_segments(self.committed_texts + [tail])
 
     def speech_mask_slice(self, start: int, end: int | None = None) -> np.ndarray | None:
         """Маска VAD для audio[start:end] поточного кроку або None (USE_VAD вимкнено)."""
         return None if self.speech_mask is None else self.speech_mask[start:end]
 
-    def commit_segment(self, segment: str, cut: int, audio, soft_cut: bool = False) -> None:
-        """Фіксує шматок довжиною cut і скидає стан хвоста.
-        soft_cut — межа в кінці шматка м'яка (див. choose_commit_cut)."""
+    def commit_segment(self, segment: str, cut: int, audio) -> None:
+        """Фіксує шматок довжиною cut і скидає стан хвоста."""
         if segment:
             self.committed_texts.append(segment)
-            self.soft_boundaries.append(soft_cut)
-        elif self.soft_boundaries:
-            # Шматок без тексту = тиша між фразами: це кінець речення.
-            self.soft_boundaries[-1] = False
         self.committed_samples += cut
         self.tail_text = ""
         self.tail_valid = not has_voiced_frames(audio[self.committed_samples:],
@@ -301,11 +293,6 @@ def has_no_new_speech_since(audio: np.ndarray, last_audio_len: int,
 # кроку не росте з довжиною фрази (раніше +~50 мс на кожну секунду).
 COMMIT_MIN_SEC = 1.0          # вікно коротше за це — не фіксуємо (мало контексту)
 COMMIT_PAUSE_SEC = 0.5       # мінімальна пауза, по якій ріжемо (0.35 різало на звичайних вдихах)
-# Пауза, довша за це, вважається кінцем речення ("тверда" межа): крапку й
-# велику літеру моделі лишаємо. Коротша пауза або примусовий розріз —
-# "м'яка" межа: це середина речення, і join_text_segments склеює шматки в одне
-# речення (прибирає крапку, першу літеру наступного шматка робить малою).
-SENTENCE_PAUSE_SEC = 0.5
 COMMIT_MAX_WINDOW_SEC = 10   # без пауз довше — ріжемо примусово по найтихішому місцю
 FORCED_CUT_SEARCH_SEC = 3.0   # де шукати найтихіше місце: останні N с вікна...
 FORCED_CUT_GUARD_SEC = 0.5    # ...але не ближче за це до кінця (там іде мовлення)
@@ -368,32 +355,27 @@ def find_last_long_pause(window: np.ndarray, min_pause: int, min_end: int,
 
 
 def choose_commit_cut(window: np.ndarray,
-                      speech_mask: np.ndarray | None = None) -> tuple[int, bool] | None:
-    """Де зафіксувати вікно: (позиція розрізу в семплах, м'яка межа) або None.
+                      speech_mask: np.ndarray | None = None) -> int | None:
+    """Де зафіксувати вікно: позиція розрізу в семплах або None.
 
-    * Є довга пауза — ріже посередині неї; межа м'яка, якщо пауза коротша
-      за SENTENCE_PAUSE_SEC (середина речення).
-    * Коротка пауза ще триває до кінця вікна — None: чекаємо, чи вона виросте.
+    * Є довга пауза — ріже посередині неї.
     * Вікно довше за COMMIT_MAX_WINDOW_SEC без пауз — примусовий розріз по
-      найтихішому кадру; така межа завжди м'яка."""
+      найтихішому кадру."""
     if len(window) < COMMIT_MIN_SEC * SAMPLE_RATE:
         return None
     min_pause = max(1, int(round(COMMIT_PAUSE_SEC / FRAME_SEC)))
-    sent_pause = max(min_pause, int(round(SENTENCE_PAUSE_SEC / FRAME_SEC)))
     min_end = int(COMMIT_MIN_SEC / FRAME_SEC)
 
     levels, last = find_last_long_pause(window, min_pause, min_end, speech_mask)
 
     if last is not None:
-        cut, length, at_end = last
-        short = length < sent_pause
-        if not (at_end and short):   # коротка пауза в кінці ще може вирости
-            return cut * FRAME_LEN, short
+        cut, _length, _at_end = last
+        return cut * FRAME_LEN
 
     if len(window) >= COMMIT_MAX_WINDOW_SEC * SAMPLE_RATE:   # вимушений розріз
         end = max(1, len(levels) - int(FORCED_CUT_GUARD_SEC / FRAME_SEC))
         start = max(0, end - int(FORCED_CUT_SEARCH_SEC / FRAME_SEC))
-        return (start + int(np.argmin(levels[start:end]))) * FRAME_LEN, True
+        return (start + int(np.argmin(levels[start:end]))) * FRAME_LEN
     return None
 
 
@@ -451,47 +433,10 @@ def apply_voice_gate(audio: np.ndarray) -> tuple[np.ndarray, float, float]:
     return audio * mask[: len(audio)], thr, float(1.0 - loud.mean())
 
 
-def _lowercase_first_letter_unless_acronym(text: str) -> str:
-    """Перша літера → мала, якщо слово не абревіатура ("США", "ЗСУ", "IT")."""
-    word = text.split(maxsplit=1)[0] if text else ""
-    if not word or not word[0].isupper():
-        return text
-    letters = [c for c in word if c.isalpha()]
-    if len(letters) > 1 and all(c.isupper() for c in letters):
-        return text
-    return text[0].lower() + text[1:]
-
-
-def join_text_segments(parts: list[str], soft: list[bool] | None = None) -> str:
-    """Склеює шматки тексту, розпізнані окремо. Модель вважає КОЖЕН шматок
-    окремим записом: ставить крапку в кінці й велику літеру на початку,
-    навіть якщо розріз був посеред речення ("рішення. Що прийняти").
-
-    soft[k] — тип межі МІЖ parts[k] і parts[k+1]:
-      True  (м'яка: коротка пауза / примусовий розріз) — одне речення:
-            крапку з кінця прибираємо, першу літеру наступного робимо малою;
-      False (тверда: довга пауза) — лишаємо як дала модель.
-    Якщо soft не передано або межа невідома — стара поведінка: крапку
-    прибираємо лише коли наступний шматок і так починається з малої."""
-    out = ""
-    prev_soft = False
-    for k, p in enumerate(parts):
-        p = p.strip()
-        if p:
-            if out:
-                single_dot = out.endswith(".") and not out.endswith("..")
-                if prev_soft and not out.endswith(("?", "!")):
-                    # Середина речення: "?"/"!" — свідомий кінець, їх не чіпаємо.
-                    p = _lowercase_first_letter_unless_acronym(p)
-                    if single_dot:
-                        out = out[:-1]
-                elif p[0].islower() and single_dot:
-                    out = out[:-1]
-            out = f"{out} {p}" if out else p
-        # межа після цього шматка; порожній шматок межу не перериває
-        if soft is not None and k < len(soft):
-            prev_soft = soft[k] if p else (prev_soft and soft[k])
-    return out
+def join_text_segments(parts: list[str]) -> str:
+    """Склеює шматки тексту, розпізнані окремо, через пробіл.
+    Пунктуацію й регістр лишає як дала модель."""
+    return " ".join(p.strip() for p in parts if p.strip())
 
 
 def average_logprob(logprobs) -> float | None:
@@ -793,16 +738,15 @@ class DictationApp:
         розпізнається і фіксується (цей прохід замість кроку); інакше
         показується вже наявний текст."""
         start = state.committed_samples
-        commit_point = choose_commit_cut(window, state.speech_mask_slice(start))
-        if commit_point is not None:
-            cut, soft_cut = commit_point
+        cut = choose_commit_cut(window, state.speech_mask_slice(start))
+        if cut is not None:
             try:
                 segment = self._recognize_committed_head(window[:cut], cut, state, duration,
                                                          state.speech_mask_slice(start, start + cut))
             except Exception as exc:  # noqa: BLE001
                 print(f"\n(помилка розпізнавання: {exc})", file=sys.stderr)
                 return
-            state.commit_segment(segment, cut, audio, soft_cut)
+            state.commit_segment(segment, cut, audio)
             self.overlay.display((state.full_text() or "Слухаю...") + self.translation_mode_suffix(),
                                  state="listening")
             return
