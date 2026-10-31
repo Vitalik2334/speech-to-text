@@ -6,7 +6,7 @@ profiling.attach_profiler(app), який обгортає методи Dictation
 слухає app.events. Вимкнути: PROFILE = False або аргумент --no-profile.
 
 Компіляція:
-uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew2 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling --hidden-import speech_detection --collect-all silero_vad --collect-all pedalboard App/UAFastConformer.py
+uv run python -m PyInstaller --noconfirm --clean --onedir --windowed --name UAFastConformerNew3 --contents-directory libs --collect-all onnx_asr --collect-all onnxruntime --copy-metadata onnx-asr --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 --hidden-import profiling --hidden-import speech_detection --collect-all silero_vad --collect-all pedalboard App/UAFastConformer.py
 """
 import collections
 import sys
@@ -75,7 +75,7 @@ KEEP_MIC_OPEN = True
 # одночасно з натисканням.
 PREROLL_SEC = 0.3
 
-OVERLAY_AUTOHIDE_MS = 4000
+OVERLAY_AUTOHIDE_MS = 1000
 OVERLAY_TOO_SHORT_MS = 1200
 STEP_INTERVAL_SEC = 0.3        # період між ПОЧАТКАМИ проміжних кроків (а не пауза після кроку)
 STEP_MIN_GAP_SEC = 0.03        # мінімальна пауза між кроками — щоб GUI/хук встигали дихати
@@ -176,6 +176,8 @@ class Recorder:
         self._preroll: collections.deque[np.ndarray] = collections.deque()
         self._preroll_len = 0
         self._preroll_max = int(PREROLL_SEC * samplerate) if KEEP_MIC_OPEN else 0
+        # Колбек для кожного чанка (потік мікрофона): оверлей малює риски голосу.
+        self.on_chunk: Callable[[np.ndarray], None] | None = None
 
     def open(self) -> None:
         import sounddevice as sd  # noqa: PLC0415
@@ -202,6 +204,8 @@ class Recorder:
         if status:
             print(status, file=sys.stderr)
         chunk = indata[:, 0].copy()
+        if self.on_chunk is not None:
+            self.on_chunk(chunk)
         with self._lock:
             if self._recording:
                 self._frames.append(chunk)
@@ -471,6 +475,7 @@ class DictationApp:
         self.overlay = Overlay()
         self.events = Events()
         self.recorder = Recorder(SAMPLE_RATE)
+        self.recorder.on_chunk = self.overlay.feed_audio
 
         self.is_recording = threading.Event()
         self.is_busy = threading.Event()
