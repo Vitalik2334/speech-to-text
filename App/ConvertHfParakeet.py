@@ -267,15 +267,19 @@ def stage_export(model, out_dir: Path, mels: int):
     dec_sess = rt.InferenceSession(str(out_dir / "decoder_joint-model.onnx"), providers=["CPUExecutionProvider"])
 
     rng = np.random.default_rng(0)
+    # Вхід БЕЗ паддінгу — так само, як його подає onnx_asr (один запис, length = усі кадри).
+    # Паддінг у тесті давав повністю замасковані рядки уваги → softmax(−∞…) = NaN
+    # у деяких версіях torch-експорту, хоча в застосунку такого входу не буває.
+    # Довжина 517 ≠ 300 (як при експорті) — перевіряє, що динамічна вісь часу працює.
     T2 = 517
     x = rng.standard_normal((1, mels, T2)).astype(np.float32)
-    xl = np.array([T2 - 40], dtype=np.int64)  # з паддінгом у кінці
+    xl = np.array([T2], dtype=np.int64)
     with torch.inference_mode():
         ref_out, ref_len = enc_w(torch.from_numpy(x), torch.from_numpy(xl))
     onnx_out, onnx_len = enc_sess.run(["outputs", "encoded_lengths"], {"audio_signal": x, "length": xl})
     check(onnx_len.tolist() == ref_len.tolist(), f"encoded_lengths збігаються: {onnx_len.tolist()}")
-    valid = int(ref_len[0])
-    diff = float(np.abs(onnx_out[..., :valid] - ref_out.numpy()[..., :valid]).max())
+    check(bool(np.isfinite(onnx_out).all()), "у виходах енкодера ONNX немає NaN/inf")
+    diff = float(np.abs(onnx_out - ref_out.numpy()).max())
     check(diff < ENCODER_ATOL, f"енкодер: max|ONNX − PyTorch| = {diff:.2e} (< {ENCODER_ATOL})")
 
     frame = onnx_out[0, :, 3]
@@ -346,8 +350,12 @@ def stage_onnx_asr(model, feature_extractor, tokenizer, out_dir: Path, test_audi
 
     # 5b. Декодування на ТИХ САМИХ ознаках: цикл onnx_asr == model.generate() у HF.
     hf_ids = hf_greedy_ids(model, feats_pt, mask_pt)
-    # HF додає зайвий кадр-паддінг (mask=0), тому довжина — кількість ВАЛІДНИХ кадрів.
-    enc_out, enc_len = asr._encode(hf_f[None].astype(np.float32), np.array([int(mask_pt.sum())], dtype=np.int64))
+    # HF додає в кінець зайвий кадр-паддінг (mask=0). В ONNX подаємо лише валідні кадри —
+    # без паддінгу, як onnx_asr у застосунку (паддінг дає NaN, див. перевірку енкодера).
+    valid = int(mask_pt.sum())
+    enc_out, enc_len = asr._encode(np.ascontiguousarray(hf_f[None, :, :valid], dtype=np.float32),
+                                   np.array([valid], dtype=np.int64))
+    check(bool(np.isfinite(enc_out).all()), "у виходах енкодера onnx_asr немає NaN/inf")
     oa_ids = [int(i) for i in next(iter(asr._decoding(enc_out, enc_len)))[0]]
     same = oa_ids == hf_ids
     check(same, f"токени onnx_asr == токени HF ({len(hf_ids)} шт.)" if same
