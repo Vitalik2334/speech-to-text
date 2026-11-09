@@ -406,6 +406,9 @@ def build_random_model(layers: int):
     with torch.no_grad():
         model.joint.head.weight.mul_(20.0)
         model.joint.head.bias[cfg.blank_token_id] -= 2.0
+        # Як у parakeet-tdt-0.6b-v3-uk: <unk> (id 0) заблоковано bias -1000.
+        # Тоді <unk> на виході може з'явитися лише від NaN (argmax по NaN = 0).
+        model.joint.head.bias[0] = -1000.0
         # Тривалість 0 для небланкового токена у випадковій моделі тягнеться нескінченно;
         # onnx_asr (як і NeMo) обмежує це max_tokens_per_step, а HF generate() — ні,
         # тож на такому виродженому вході цикли розходяться. Навчена модель так не робить.

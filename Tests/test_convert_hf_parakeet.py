@@ -5,9 +5,13 @@
 механізм експорту (ONNX == PyTorch, формат для onnx_asr), а не якість розпізнавання.
 
     uv run pytest Tests/test_convert_hf_parakeet.py -v
+    uv run pytest -m export -v          # те саме за маркером
+    uv run pytest -m "not export"       # усе, крім цих тестів
 """
 import numpy as np
 import pytest
+
+pytestmark = pytest.mark.export
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
@@ -88,6 +92,59 @@ def test_encoder_matches_pytorch_without_padding(exported, frames):
     assert out_len.tolist() == ref_len.tolist()
     assert out.shape == (1, 1024, int(ref_len[0]))
     np.testing.assert_allclose(out, ref.numpy(), atol=conv.ENCODER_ATOL)
+
+
+@pytest.mark.parametrize("frames,valid", [(193, 192), (517, 477), (300, 120)])
+def test_encoder_padded_input_has_no_nan(exported, frames, valid):
+    """Вхід з паддінгом у кінці (кадрів більше, ніж length).
+
+    Саме так onnx_asr подає ознаки: препроцесор nemo128 дає на 1 кадр більше,
+    ніж валідна довжина, і для ~12% довжин після стиснення ×8 виникає повністю
+    замаскований кадр енкодера. Softmax по рядку з одних −∞ = NaN, який через увагу
+    розходиться на всі кадри → декодер видає <unk><unk>… (NaN → argmax = 0)."""
+    model, *_, out_dir = exported
+    enc_w, _ = conv.make_wrappers(model)
+    sess = rt.InferenceSession(str(out_dir / "encoder-model.onnx"), providers=["CPUExecutionProvider"])
+
+    x = np.random.default_rng(frames).standard_normal((1, 128, frames)).astype(np.float32)
+    xl = np.array([valid], dtype=np.int64)
+    out, out_len = sess.run(["outputs", "encoded_lengths"], {"audio_signal": x, "length": xl})
+    with torch.inference_mode():
+        ref, ref_len = enc_w(torch.from_numpy(x), torch.from_numpy(xl))
+
+    n = int(ref_len[0])
+    assert out_len.tolist() == ref_len.tolist()
+    assert np.isfinite(out).all(), f"NaN/inf у виході енкодера: {np.isnan(out).mean():.0%} значень"
+    np.testing.assert_allclose(out[..., :n], ref.numpy()[..., :n], atol=conv.ENCODER_ATOL)
+
+
+def test_onnx_asr_audio_with_padded_encoder_frame(exported):
+    """Відтворення реального збою: кліп 1.924 с з VTT_DATASET давав суцільні <unk>.
+
+    Перевіряє весь шлях застосунку (аудіо → препроцесор onnx_asr → енкодер → декодер)."""
+    import onnx_asr
+
+    model, fe, tokenizer, out_dir = exported
+    asr_model = onnx_asr.load_model("nemo-conformer-tdt", str(out_dir))
+    asr = asr_model.asr
+    audio = _noise(1.924, seed=3)
+
+    # Передумова: для цієї довжини onnx_asr справді дає зайвий (замаскований) кадр енкодера.
+    feats, flen = asr._preprocessor(audio[None], np.array([len(audio)], dtype=np.int64))
+    sub = model.encoder._get_subsampling_output_length
+    total, valid = int(sub(torch.tensor([feats.shape[2]]))), int(sub(torch.tensor([int(flen[0])])))
+    assert (feats.shape[2], int(flen[0]), total, valid) == (193, 192, 25, 24)
+
+    enc_out, enc_len = asr._encode(feats, flen)
+    assert np.isfinite(enc_out).all(), "NaN у виході енкодера onnx_asr"
+
+    hf_feats, hf_mask = conv.hf_features(fe, audio)
+    ref = " ".join(tokenizer.decode(conv.hf_greedy_ids(model, hf_feats, hf_mask),
+                                    skip_special_tokens=True, group_tokens=False).split())
+    res = asr_model.with_timestamps().recognize(audio, sample_rate=SAMPLE_RATE)
+    assert "<unk>" not in res.text
+    assert " ".join(res.text.split()) == ref
+    assert all(np.isfinite(res.logprobs))
 
 
 def test_decoder_joint_matches_pytorch(exported):
