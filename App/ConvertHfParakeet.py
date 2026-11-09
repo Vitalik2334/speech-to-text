@@ -61,6 +61,41 @@ class StageError(RuntimeError):
     pass
 
 
+# transformers < 5.22 маскує увагу енкодера Parakeet значенням −∞ (matrix_bd.masked_fill_(…, -inf)).
+# Для повністю замаскованого кадру (onnx_asr дає його приблизно на кожному 8-му записі)
+# softmax(−∞, …, −∞) = NaN → увесь вихід енкодера NaN → onnx_asr пише <unk><unk><unk>…
+# У новіших версіях маска — найменше скінченне число, і NaN немає.
+MIN_TRANSFORMERS = "5.22.0"
+
+
+def check_transformers_version(installed: str | None = None) -> str:
+    """Зупиняє скрипт, якщо transformers старіший за MIN_TRANSFORMERS.
+
+    installed — версія для перевірки (у тестах); None — береться встановлена.
+    Повертає перевірену версію."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
+
+    fix = f'uv add "transformers>={MIN_TRANSFORMERS}" "huggingface-hub>=1.31.0"'
+    if installed is None:
+        try:
+            installed = version("transformers")
+        except PackageNotFoundError:
+            raise StageError(f"transformers не встановлено. Потрібна версія >= {MIN_TRANSFORMERS}:\n    {fix}") from None
+    try:
+        too_old = Version(installed) < Version(MIN_TRANSFORMERS)
+    except InvalidVersion:
+        raise StageError(f"не вдалося розібрати версію transformers: {installed!r}") from None
+    if too_old:
+        raise StageError(
+            f"transformers {installed} застарий, потрібна версія >= {MIN_TRANSFORMERS}.\n"
+            f"    У старих версіях маска уваги енкодера = −∞ → NaN → модель видає <unk><unk>…\n"
+            f"    Оновіть:  {fix}"
+        )
+    return installed
+
+
 def stage(title: str):
     print(f"\n=== {title} ===", flush=True)
 
@@ -467,6 +502,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--selftest", action="store_true", help="перевірити експорт на випадкових вагах")
     ap.add_argument("--selftest-layers", type=int, default=2)
     args = ap.parse_args(argv)
+
+    # Першою справою: зі старим transformers експорт дав би модель, що пише <unk>.
+    try:
+        ok(f"transformers {check_transformers_version()} (потрібно >= {MIN_TRANSFORMERS})")
+    except StageError as e:
+        print(f"\n❌ Зупинено: {e}")
+        return 1
 
     if args.selftest:
         return run_selftest(args.selftest_layers)
