@@ -21,12 +21,13 @@ from PySide6.QtCore import QObject, Signal, Qt, QTimer
 from PySide6.QtWidgets import QApplication
 from hotkeys_manager import HotkeyManager
 from pynput.keyboard import Controller as KbController
-from models_config import MODEL_TYPES, RECOMMENDED_CPU_QUANTIZATION, WHISPER_LANGUAGE, WHISPER_MODELS, ModelName
+from models_config import (MODEL_PATHS, MODEL_TYPES, RECOMMENDED_CPU_QUANTIZATION, WHISPER_LANGUAGE,
+                           WHISPER_MODELS, ModelName)
 from overlay import Overlay
 import speech_detection
 
 #TODO Після відправки цілого повідомлення. І ще раз пропускати все через модель.
-ACTIVE_MODEL = ModelName.NEMO_PARAKEET
+ACTIVE_MODEL = ModelName.PARAKEET_UK
 # --- Апаратний профіль ---------------------------------------------------
 FORCE_CPU = True
 print(f"{FORCE_CPU=}")
@@ -37,6 +38,7 @@ QUANTIZATION = RECOMMENDED_CPU_QUANTIZATION[ACTIVE_MODEL] if FORCE_CPU else None
 print(f"{QUANTIZATION=},{RECOMMENDED_CPU_QUANTIZATION[ACTIVE_MODEL]=}")
 # --------------------------------------------------------------------------
 MODEL_TYPE = MODEL_TYPES[ACTIVE_MODEL]
+MODEL_PATH = MODEL_PATHS[ACTIVE_MODEL]   # None = onnx_asr качає з Hugging Face сам
 EXPECTED_FILES = ("encoder-model.onnx", "decoder_joint-model.onnx", "vocab.txt", "config.json")
 
 HOTKEY = "shift+1"
@@ -498,7 +500,7 @@ class DictationApp:
         provider_label = "CPU" if FORCE_CPU else "GPU (з fallback на CPU)"
         quant_label = QUANTIZATION or "fp32"
         print(f"Модель: {ACTIVE_MODEL.value} | провайдер: {provider_label} | квантизація: {quant_label}")
-        print(f"Завантаження моделі {MODEL_TYPE}")
+        print(f"Завантаження моделі {MODEL_TYPE}" + (f" з {MODEL_PATH}" if MODEL_PATH else ""))
         self.overlay.display("Завантаження моделі...", state="info")
 
         self.model = self._load_asr_model()
@@ -518,7 +520,16 @@ class DictationApp:
     def _load_asr_model(self):
         import onnx_asr  # noqa: PLC0415
 
-        return onnx_asr.load_model(MODEL_TYPE, quantization=QUANTIZATION, providers=PROVIDERS)
+        if MODEL_PATH is None:
+            return onnx_asr.load_model(MODEL_TYPE, quantization=QUANTIZATION, providers=PROVIDERS)
+
+        missing = [name for name in EXPECTED_FILES if not (MODEL_PATH / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"У {MODEL_PATH} бракує {missing}. Для {ACTIVE_MODEL.value} спершу виконайте:\n"
+                f"    uv run python App/ConvertHfParakeet.py --test-wav <фраза.wav>"
+            )
+        return onnx_asr.load_model(MODEL_TYPE, str(MODEL_PATH), quantization=QUANTIZATION, providers=PROVIDERS)
 
     def _load_translator(self):
         from transformers import MarianMTModel, MarianTokenizer  # noqa: PLC0415
